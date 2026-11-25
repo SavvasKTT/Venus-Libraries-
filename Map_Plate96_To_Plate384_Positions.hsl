@@ -1,0 +1,397 @@
+// =====================================================================
+// Map_Plate96_To_Plate384_Positions.hsl
+// ---------------------------------------------------------------------
+// Made by Savvas
+//
+// WHAT IT IS
+//   Universal helper to transfer from a 96 well plate to a 384 well plate.
+//   It builds the 384 destination sequence from the 96 source sequence,
+//   position by position, so the Aspirate step (96 plate) and the
+//   Dispense step (384 plate) always match 1 to 1.
+//
+// MODES (i_intMode)
+//   0 = SAME WELL NAME        A1 -> A1, B1 -> B1, H12 -> H12
+//                             (the 96 samples go to the top left part of
+//                              the 384 plate, rows A to H, columns 1 to 12)
+//   1 = INTERLEAVED quadrant 1  A1 -> A1, B1 -> C1, A2 -> A3  (odd row, odd column)
+//   2 = INTERLEAVED quadrant 2  A1 -> A2, B1 -> C2, A2 -> A4  (odd row, even column)
+//   3 = INTERLEAVED quadrant 3  A1 -> B1, B1 -> D1, A2 -> B3  (even row, odd column)
+//   4 = INTERLEAVED quadrant 4  A1 -> B2, B1 -> D2, A2 -> B4  (even row, even column)
+//   5 = BLOCK top left          A1 -> A1   (the same as mode 0)
+//   6 = BLOCK top right         A1 -> A13, H12 -> H24
+//   7 = BLOCK bottom left       A1 -> I1,  H12 -> P12
+//   8 = BLOCK bottom right      A1 -> I13, H12 -> P24
+//
+//   Interleaved = the standard way to put four 96 plates into one 384 plate.
+//   Note for mode 0 and modes 5 to 8: neighbour wells of a 384 plate are
+//   4.5 mm apart, the 1000 uL channels are 9 mm apart. VENUS then
+//   dispenses one column of 8 in two moves (slower, but it works).
+//   In modes 1 to 4 the wells are 9 mm apart, so 8 channels go in one move.
+//
+// WHERE THE FILE GOES
+//   C:\Program Files (x86)\Hamilton\Library\
+//   (or the Library folder of the method)
+//
+// NAMING
+//   i_ = input, o_ = output, io_ = changed by the function
+//   str = text, int = whole number, seq = sequence
+// =====================================================================
+
+#ifndef __MAP_PLATE96_TO_PLATE384_POSITIONS_HSL__
+#define __MAP_PLATE96_TO_PLATE384_POSITIONS_HSL__ 1
+
+#include "HSLStrLib.hsl"
+#include "HSLSeqLib.hsl"
+
+namespace MAP_PLATE96_TO_PLATE384_POSITIONS {
+
+// ---------------------------------------------------------------------
+// GetRowNumber (private)
+// ---------------------------------------------------------------------
+// RETURNS the row number of a well name: "A1" -> 1, "H12" -> 8, "P24" -> 16.
+//   Small letters also work ("b3" -> 2). Returns 0 if the first character
+//   is not a letter A to P.
+// ---------------------------------------------------------------------
+private function GetRowNumber( variable i_strWell ) variable
+{
+    variable strLetter;   // first character of the well name
+    variable intIndex;    // place of the letter in the alphabet text, -1 = not found
+
+    if (StrGetLength(i_strWell) < 2)
+    {
+        return (0);
+    }
+    strLetter = StrMid(i_strWell, 0, 1);
+    intIndex = StrFind("ABCDEFGHIJKLMNOP", strLetter);
+    if (intIndex == -1)
+    {
+        intIndex = StrFind("abcdefghijklmnop", strLetter);
+    }
+    if (intIndex == -1)
+    {
+        return (0);
+    }
+    return (intIndex + 1);
+}
+
+// ---------------------------------------------------------------------
+// GetColumnNumber (private)
+// ---------------------------------------------------------------------
+// RETURNS the column number of a well name: "A1" -> 1, "A01" -> 1,
+//   "H12" -> 12. Returns 0 if there is no number after the letter.
+// ---------------------------------------------------------------------
+private function GetColumnNumber( variable i_strWell ) variable
+{
+    variable strNumber;   // the part after the letter, e.g. "12"
+    variable strChar;     // one character of strNumber
+    variable intLen;      // length of strNumber
+    variable i;           // character index
+
+    intLen = StrGetLength(i_strWell) - 1;
+    if (intLen < 1)
+    {
+        return (0);
+    }
+    strNumber = StrMid(i_strWell, 1, intLen);
+    i = 0;
+    while (i < intLen)
+    {
+        strChar = StrMid(strNumber, i, 1);
+        if (StrFind("0123456789", strChar) == -1)
+        {
+            return (0);
+        }
+        i = i + 1;
+    }
+    return (StrIVal(strNumber));
+}
+
+// ---------------------------------------------------------------------
+// GetWellFromNumber (private)
+// ---------------------------------------------------------------------
+// RETURNS the 96 well name of a position number, counted column by column
+//   like Hamilton does: 1 -> "A1", 2 -> "B1", 8 -> "H1", 9 -> "A2", 96 -> "H12".
+//   Used when a sequence has numbers ("1", "2") instead of well names.
+//   Returns "" if the number is outside 1 to 96.
+// ---------------------------------------------------------------------
+private function GetWellFromNumber( variable i_intNumber ) variable
+{
+    variable intRow;      // 1 to 8
+    variable intCol;      // 1 to 12
+
+    if ((i_intNumber < 1) || (i_intNumber > 96))
+    {
+        return ("");
+    }
+    intCol = ((i_intNumber - 1) - ((i_intNumber - 1) % 8)) / 8 + 1;
+    intRow = ((i_intNumber - 1) % 8) + 1;
+    return (StrMid("ABCDEFGH", intRow - 1, 1) + StrIStr(intCol));
+}
+
+// ---------------------------------------------------------------------
+// MapWell
+// ---------------------------------------------------------------------
+// WHAT IT DOES
+//   Translates ONE 96 well name into the 384 well name for the mode.
+//
+// PARAMETERS
+//   i_strWell96   (input, text) 96 well name, e.g. "A1", "H12", "A01".
+//                 A position number like "1" or "96" also works
+//                 (column by column: 1 = A1, 2 = B1 ... 96 = H12).
+//   i_intMode     (input, number) 0 to 8, see MODES at the top of the file.
+//                 0 = same well name (A1 -> A1).
+//
+// RETURNS (text) the 384 well name, e.g. "A1", or "" if the input well or
+//   the mode is wrong (an error line is written in the trace).
+//
+// EXAMPLE
+//   MapWell("B3", 0) -> "B3"
+//   MapWell("B3", 1) -> "C5"
+//   MapWell("B3", 6) -> "B15"
+// ---------------------------------------------------------------------
+function MapWell( variable i_strWell96, variable i_intMode ) variable
+{
+    variable strWell;     // 96 well name (after converting a number)
+    variable intRow;      // 96 row, 1 to 8
+    variable intCol;      // 96 column, 1 to 12
+    variable intRow384;   // 384 row, 1 to 16
+    variable intCol384;   // 384 column, 1 to 24
+    variable strType;     // "i", "f" or "s" = whole number, decimal, text
+
+    strWell = i_strWell96;
+    strType = StrGetType(i_strWell96);
+    if (strType != "s")
+    {
+        strWell = GetWellFromNumber(i_strWell96);
+    }
+    else
+    {
+        if (GetRowNumber(strWell) == 0)
+        {
+            // text that is a number, e.g. "12"
+            strWell = GetWellFromNumber(StrIVal(i_strWell96));
+        }
+    }
+
+    intRow = GetRowNumber(strWell);
+    intCol = GetColumnNumber(strWell);
+    if ((intRow < 1) || (intRow > 8) || (intCol < 1) || (intCol > 12))
+    {
+        Trace("MapWell ERROR: '", i_strWell96, "' is not a 96 well name (A1 to H12).");
+        return ("");
+    }
+
+    if ((i_intMode == 0) || (i_intMode == 5))
+    {
+        intRow384 = intRow;
+        intCol384 = intCol;
+    }
+    else if (i_intMode == 1)
+    {
+        intRow384 = 2 * intRow - 1;
+        intCol384 = 2 * intCol - 1;
+    }
+    else if (i_intMode == 2)
+    {
+        intRow384 = 2 * intRow - 1;
+        intCol384 = 2 * intCol;
+    }
+    else if (i_intMode == 3)
+    {
+        intRow384 = 2 * intRow;
+        intCol384 = 2 * intCol - 1;
+    }
+    else if (i_intMode == 4)
+    {
+        intRow384 = 2 * intRow;
+        intCol384 = 2 * intCol;
+    }
+    else if (i_intMode == 6)
+    {
+        intRow384 = intRow;
+        intCol384 = intCol + 12;
+    }
+    else if (i_intMode == 7)
+    {
+        intRow384 = intRow + 8;
+        intCol384 = intCol;
+    }
+    else if (i_intMode == 8)
+    {
+        intRow384 = intRow + 8;
+        intCol384 = intCol + 12;
+    }
+    else
+    {
+        Trace("MapWell ERROR: mode ", i_intMode, " is not allowed. Use 0 to 8.");
+        return ("");
+    }
+
+    return (StrMid("ABCDEFGHIJKLMNOP", intRow384 - 1, 1) + StrIStr(intCol384));
+}
+
+// ---------------------------------------------------------------------
+// Build384Sequence
+// ---------------------------------------------------------------------
+// WHAT IT DOES
+//   Empties io_seqDest384 and fills it with one 384 well for every
+//   position of i_seqSource96 (from its current position to its end
+//   position), in the same order. After this:
+//     Aspirate step  -> i_seqSource96
+//     Dispense step  -> io_seqDest384
+//   and position 1 goes to position 1, 2 to 2, and so on.
+//   The current position of i_seqSource96 is not changed.
+//   io_seqDest384 starts at position 1, end position = number of wells.
+//
+// PARAMETERS
+//   i_seqSource96      (sequence) the 96 plate wells to transfer, e.g.
+//                      ML_STAR.PCR96_Samples. Set its current and end
+//                      position first if you do not want all wells.
+//   io_seqDest384      (sequence, changed) the sequence the dispense step
+//                      uses, e.g. ML_STAR.seq384_Dest. Its old positions
+//                      are removed.
+//   i_strLabwareID384  (input, text) labware ID of the 384 plate on the
+//                      deck, e.g. "Nun_384_Sq_L_0001".
+//                      If you give "" (empty), the labware ID of the
+//                      first position of io_seqDest384 is used, so you
+//                      can make io_seqDest384 in the Sequence Editor with
+//                      any well of the 384 plate.
+//   i_intMode          (input, number) 0 to 8, see MODES at the top.
+//                      0 = same well name (A1 -> A1).
+//
+// RETURNS (number) how many wells were added, or -1 if there was an error
+//   (then io_seqDest384 is not changed, the reason is in the trace)
+// ---------------------------------------------------------------------
+function Build384Sequence( sequence & i_seqSource96, sequence & io_seqDest384,
+                           variable i_strLabwareID384, variable i_intMode ) variable
+{
+    variable strLabware;      // labware ID of the 384 plate
+    variable strWell96;       // well of the 96 plate
+    variable strWell384;      // translated well of the 384 plate
+    variable arrWells384[];   // all translated 384 wells, in order
+    variable intStart;        // current position of the source
+    variable intEnd;          // end position of the source
+    variable intPos;          // position that is read
+    variable intAdded;        // wells added to io_seqDest384
+    variable i;               // index in arrWells384
+
+    // ---- labware ID of the 384 plate
+    strLabware = i_strLabwareID384;
+    if (strLabware == "")
+    {
+        if (SeqGetTotal(io_seqDest384) < 1)
+        {
+            Trace("Build384Sequence ERROR: no 384 labware ID given and ", SeqGetName(io_seqDest384),
+                  " is empty. Give the labware ID, e.g. \"Nun_384_Sq_L_0001\".");
+            return (-1);
+        }
+        io_seqDest384.SetCurrentPosition(1);
+        strLabware = io_seqDest384.GetLabwareId();
+    }
+
+    // ---- read and translate all source positions first
+    intStart = i_seqSource96.GetCurrentPosition();
+    intEnd = i_seqSource96.GetCount();
+    if ((intStart < 1) || (intEnd < intStart))
+    {
+        Trace("Build384Sequence ERROR: ", SeqGetName(i_seqSource96), " has no positions to transfer (current ",
+              intStart, ", end ", intEnd, ").");
+        return (-1);
+    }
+
+    arrWells384.SetSize(0);
+    intPos = intStart;
+    while (intPos <= intEnd)
+    {
+        i_seqSource96.SetCurrentPosition(intPos);
+        strWell96 = i_seqSource96.GetPositionId();
+        strWell384 = MapWell(strWell96, i_intMode);
+        if (strWell384 == "")
+        {
+            i_seqSource96.SetCurrentPosition(intStart);
+            Trace("Build384Sequence ERROR at source position ", intPos, " (", strWell96, "). Nothing changed.");
+            return (-1);
+        }
+        arrWells384.AddAsLast(strWell384);
+        intPos = intPos + 1;
+    }
+    i_seqSource96.SetCurrentPosition(intStart);
+
+    // ---- fill the destination sequence
+    io_seqDest384.RemoveAll();
+    intAdded = 0;
+    i = 0;
+    while (i < arrWells384.GetSize())
+    {
+        io_seqDest384.Add(strLabware, arrWells384.GetAt(i));
+        Trace("Build384Sequence: ", SeqGetName(i_seqSource96), " position ", intStart + i, " -> ",
+              strLabware, " ", arrWells384.GetAt(i));
+        intAdded = intAdded + 1;
+        i = i + 1;
+    }
+    io_seqDest384.SetCurrentPosition(1);
+    io_seqDest384.SetCount(intAdded);
+
+    Trace("Build384Sequence: ", intAdded, " wells, mode ", i_intMode, ", ", SeqGetName(i_seqSource96),
+          " -> ", SeqGetName(io_seqDest384), " (", strLabware, ")");
+    return (intAdded);
+}
+
+// ---------------------------------------------------------------------
+// Build384SequenceForPlate
+// ---------------------------------------------------------------------
+// WHAT IT DOES
+//   For 4 x 96 plates into ONE 384 plate. You give the plate number
+//   (1, 2, 3 or 4) and the layout, and it calls Build384Sequence with
+//   the right mode. Use it once for each 96 plate (for example in a loop
+//   with the loop counter as plate number).
+//
+// PARAMETERS
+//   i_seqSource96      (sequence) wells of THIS 96 plate, e.g. ML_STAR.PCR96_Plate1
+//   io_seqDest384      (sequence, changed) the dispense sequence on the 384 plate
+//   i_strLabwareID384  (input, text) labware ID of the 384 plate, or "" (see Build384Sequence)
+//   i_intPlateNumber   (input, number) 1, 2, 3 or 4 = which 96 plate this is
+//   i_intLayout        (input, number)
+//                      1 = INTERLEAVED (standard 384 layout, 9 mm spacing, fast):
+//                          plate 1 -> A1, A3 ... (mode 1)   plate 2 -> A2, A4 ... (mode 2)
+//                          plate 3 -> B1, B3 ... (mode 3)   plate 4 -> B2, B4 ... (mode 4)
+//                      2 = BLOCK (each plate in one corner, same well names
+//                          for plate 1):
+//                          plate 1 -> top left  A1-H12  (mode 5)
+//                          plate 2 -> top right A13-H24 (mode 6)
+//                          plate 3 -> bottom left I1-P12 (mode 7)
+//                          plate 4 -> bottom right I13-P24 (mode 8)
+//
+// RETURNS (number) how many wells were added, or -1 if there was an error
+// ---------------------------------------------------------------------
+function Build384SequenceForPlate( sequence & i_seqSource96, sequence & io_seqDest384,
+                                   variable i_strLabwareID384, variable i_intPlateNumber,
+                                   variable i_intLayout ) variable
+{
+    variable intMode;   // mode for Build384Sequence
+
+    if ((i_intPlateNumber < 1) || (i_intPlateNumber > 4))
+    {
+        Trace("Build384SequenceForPlate ERROR: plate number ", i_intPlateNumber, " is not allowed. Use 1 to 4.");
+        return (-1);
+    }
+    if (i_intLayout == 1)
+    {
+        intMode = i_intPlateNumber;
+    }
+    else if (i_intLayout == 2)
+    {
+        intMode = i_intPlateNumber + 4;
+    }
+    else
+    {
+        Trace("Build384SequenceForPlate ERROR: layout ", i_intLayout, " is not allowed. Use 1 (interleaved) or 2 (block).");
+        return (-1);
+    }
+    Trace("Build384SequenceForPlate: 96 plate ", i_intPlateNumber, ", layout ", i_intLayout, " -> mode ", intMode);
+    return (Build384Sequence(i_seqSource96, io_seqDest384, i_strLabwareID384, intMode));
+}
+
+} // namespace MAP_PLATE96_TO_PLATE384_POSITIONS
+
+#endif
